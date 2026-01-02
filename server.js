@@ -9,20 +9,20 @@ const Stripe = require("stripe");
 // ======================
 // VALIDARE ENV
 // ======================
-if (
-  !process.env.SUPABASE_URL ||
-  !process.env.SUPABASE_SERVICE_ROLE_KEY
-) {
-  console.error("❌ Missing SUPABASE env variables");
-  process.exit(1);
-}
+const REQUIRED_ENVS = [
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "STRIPE_SECRET_KEY",
+  "STRIPE_WEBHOOK_SECRET",
+  "STRIPE_PRICE_STANDARD",
+  "STRIPE_PRICE_PREMIUM"
+];
 
-if (
-  !process.env.STRIPE_SECRET_KEY ||
-  !process.env.STRIPE_WEBHOOK_SECRET
-) {
-  console.error("❌ Missing STRIPE env variables");
-  process.exit(1);
+for (const key of REQUIRED_ENVS) {
+  if (!process.env[key]) {
+    console.error(`❌ Missing env var: ${key}`);
+    process.exit(1);
+  }
 }
 
 // ======================
@@ -37,8 +37,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 
-// ⚠️ ATENȚIE: webhook-ul Stripe cere RAW body,
-// deci JSON middleware NU trebuie să-l afecteze
+// ⚠️ Stripe webhook MUST use RAW body
 app.use(
   "/stripe/webhook",
   bodyParser.raw({ type: "application/json" })
@@ -122,13 +121,75 @@ app.post("/stripe/webhook", async (req, res) => {
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object;
-        console.log("✅ Checkout completed:", session.id);
+
+        const customerEmail = session.customer_email;
+        const stripeCustomerId = session.customer;
+        const stripeSubscriptionId = session.subscription;
+
+        if (!customerEmail || !stripeSubscriptionId) {
+          console.warn("⚠️ Missing email or subscription id");
+          break;
+        }
+
+        // 1️⃣ găsim user Supabase după email
+        const { data: userData, error: userError } =
+          await supabaseAdmin.auth.admin.listUsers({
+            email: customerEmail
+          });
+
+        if (userError || !userData?.users?.length) {
+          console.error(
+            "❌ Supabase user not found for email:",
+            customerEmail
+          );
+          break;
+        }
+
+        const user = userData.users[0];
+
+        // 2️⃣ luăm detalii abonament Stripe
+        const subscription = await stripe.subscriptions.retrieve(
+          stripeSubscriptionId
+        );
+
+        const priceId = subscription.items.data[0].price.id;
+
+        // 3️⃣ mapare price → plan
+        let plan = "free";
+        if (priceId === process.env.STRIPE_PRICE_STANDARD)
+          plan = "standard";
+        if (priceId === process.env.STRIPE_PRICE_PREMIUM)
+          plan = "premium";
+
+        // 4️⃣ upsert în Supabase
+        await supabaseAdmin.from("subscriptions").upsert({
+          user_id: user.id,
+          plan,
+          status: "active",
+          stripe_customer_id: stripeCustomerId,
+          stripe_subscription_id: stripeSubscriptionId,
+          current_period_end: new Date(
+            subscription.current_period_end * 1000
+          ).toISOString()
+        });
+
+        console.log(
+          "✅ Subscription activated:",
+          user.email,
+          plan
+        );
         break;
       }
 
       case "customer.subscription.deleted": {
-        const subscription = event.data.object;
-        console.log("❌ Subscription deleted:", subscription.id);
+        const sub = event.data.object;
+
+        await supabaseAdmin
+          .from("subscriptions")
+          .update({ status: "canceled" })
+          .eq("stripe_subscription_id", sub.id);
+
+        console.log("❌ Subscription canceled:", sub.id);
         break;
       }
 
